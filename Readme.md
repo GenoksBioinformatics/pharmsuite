@@ -38,13 +38,11 @@ docker run --rm \
   -v /path/to/input_data:/data \
   -v /path/to/output_dir:/out \
   pharmsuite:latest \
-  bash -lc '
     python3 /usr/local/bin/pharmcat_pipeline.py \
       --cram /data/sample.cram \
       --reference /data/reference.fa \
       --outdir /out \
       --sample-id SAMPLE_ID
-  '
 ```
 
 ## Run mpileup annotation only (Check each variant's depth & AF)

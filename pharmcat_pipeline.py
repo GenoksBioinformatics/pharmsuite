@@ -20,23 +20,40 @@ JAVA_MEM = "100g"
 MIN_BCFTOOLS_VERSION = (1, 20)
 
 
+REF_GTS = {"0/0", "0|0", "0", "./.", ".|.", "."}
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Single-sample PharmCAT pipeline with flat output layout."
+        description=(
+            "Single-sample PharmCAT pipeline. Generates forcecalled PGx VCF, "
+            "optionally refines forcecalled genotypes with a DRAGEN VCF, then runs PharmCAT."
+        )
     )
     parser.add_argument("--cram", required=True, help="Input CRAM or BAM path")
     parser.add_argument("--reference", required=True, help="Reference FASTA path")
     parser.add_argument("--outdir", required=True, help="Output directory")
     parser.add_argument("--sample-id", required=True, help="Sample ID prefix for all outputs")
+    parser.add_argument(
+        "--dragen-vcf",
+        required=False,
+        default=None,
+        help=(
+            "Optional DRAGEN VCF/VCF.GZ. If provided, PharmCAT forcecall genotypes are "
+            "refined against DRAGEN: DRAGEN PASS non-ref genotypes are used; all other "
+            "forcecalled sites are forced to 0/0."
+        ),
+    )
     return parser.parse_args()
 
 
 class PharmcatPipeline:
-    def __init__(self, cram, reference_fasta, output_dir, sample_id):
+    def __init__(self, cram, reference_fasta, output_dir, sample_id, dragen_vcf=None):
         self.alignment = Path(cram).expanduser().resolve()
         self.reference_fasta = Path(reference_fasta).expanduser().resolve()
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.sample_id = sample_id.strip()
+        self.dragen_vcf = Path(dragen_vcf).expanduser().resolve() if dragen_vcf else None
 
         if not self.sample_id:
             raise ValueError("sample_id cannot be empty")
@@ -166,12 +183,262 @@ class PharmcatPipeline:
             fh.write(f"sample_id\t{self.sample_id}\n")
             fh.write(f"alignment\t{self.alignment}\n")
             fh.write(f"reference_fasta\t{self.reference_fasta}\n")
+            fh.write(f"dragen_vcf\t{self.dragen_vcf if self.dragen_vcf else 'NA'}\n")
             fh.write(f"pharmcat_jar\t{PHARMCAT_JAR}\n")
             fh.write(f"pharmcat_preprocessor\t{PHARMCAT_PREPROCESSOR}\n")
             fh.write(f"positions_sites_vcf\t{POSITIONS_SITES_VCF}\n")
             fh.write(f"positions_ref_vcf\t{POSITIONS_REF_VCF}\n")
             fh.write(f"threads\t{THREADS}\n")
             fh.write(f"java_mem\t{JAVA_MEM}\n")
+
+    def open_text_auto(self, path):
+        path = Path(path)
+        suffixes = path.suffixes
+        if path.suffix in {".gz", ".bgz"} or suffixes[-2:] in [[".vcf", ".gz"]]:
+            return gzip.open(path, "rt")
+        return open(path, "r")
+
+    @staticmethod
+    def normalize_gt(gt):
+        if gt is None:
+            return None, "/"
+        sep = "|" if "|" in gt else "/"
+        alleles = gt.replace("|", "/").split("/")
+        return alleles, sep
+
+    @staticmethod
+    def gt_is_nonref(gt):
+        if gt is None or gt in REF_GTS:
+            return False
+        alleles, _sep = PharmcatPipeline.normalize_gt(gt)
+        if not alleles:
+            return False
+        return any(a not in {"0", "."} for a in alleles)
+
+    @staticmethod
+    def force_ref_gt_like_existing(gt):
+        """
+        Return 0/0 with the same ploidy/separator as the existing GT when possible.
+        PharmCAT generally expects diploid GT, so missing/odd GT also becomes 0/0.
+        """
+        alleles, sep = PharmcatPipeline.normalize_gt(gt)
+        if not alleles or alleles == ["."]:
+            return "0/0"
+        if len(alleles) == 1:
+            return "0"
+        return sep.join(["0"] * len(alleles))
+
+    def parse_dragen_gt_by_site(self, dragen_vcf):
+        """
+        Reads DRAGEN VCF and stores PASS non-ref genotypes by (CHROM, POS, REF).
+        We keep ALT order and GT so that it can be translated onto forcecall ALT order.
+        """
+        self.ensure_file(dragen_vcf, "DRAGEN VCF")
+
+        dragen_by_site = {}
+        samples = []
+        total_records = 0
+        kept_records = 0
+
+        with self.open_text_auto(dragen_vcf) as fh:
+            for line in fh:
+                if line.startswith("##"):
+                    continue
+
+                if line.startswith("#CHROM"):
+                    header = line.rstrip("\n").split("\t")
+                    samples = header[9:]
+                    if not samples:
+                        raise RuntimeError("DRAGEN VCF does not contain a sample column")
+                    continue
+
+                if not line.strip():
+                    continue
+
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 10:
+                    continue
+
+                total_records += 1
+
+                chrom, pos, _id, ref, alt, _qual, filt = cols[:7]
+                if filt not in {"PASS", "."}:
+                    continue
+
+                fmt_keys = cols[8].split(":")
+                sample_values = cols[9].split(":")
+                fmt = dict(zip(fmt_keys, sample_values))
+                gt = fmt.get("GT")
+
+                if not self.gt_is_nonref(gt):
+                    continue
+
+                alts = alt.split(",")
+                site_key = (chrom, pos, ref)
+                dragen_by_site[site_key] = {
+                    "alts": alts,
+                    "gt": gt,
+                    "filter": filt,
+                }
+                kept_records += 1
+
+        if not samples:
+            raise RuntimeError("Could not find #CHROM header line in DRAGEN VCF")
+
+        self.log(f"[INFO] DRAGEN sample used for refinement: {samples[0]}")
+        self.log(f"[INFO] DRAGEN records scanned: {total_records}")
+        self.log(f"[INFO] DRAGEN PASS non-ref records loaded: {kept_records}")
+
+        return dragen_by_site
+
+    def translate_dragen_gt_to_forcecall_gt(self, dragen_record, forcecall_alts):
+        """
+        Translate DRAGEN GT allele indexes to forcecall ALT indexes.
+        Returns None if DRAGEN ALT cannot be represented in the forcecall record.
+        """
+        dragen_gt = dragen_record["gt"]
+        dragen_alts = dragen_record["alts"]
+
+        dragen_alleles, sep = self.normalize_gt(dragen_gt)
+        if not dragen_alleles:
+            return None
+
+        translated = []
+        for allele in dragen_alleles:
+            if allele == ".":
+                return None
+            if allele == "0":
+                translated.append("0")
+                continue
+
+            try:
+                dragen_alt_index = int(allele) - 1
+            except ValueError:
+                return None
+
+            if dragen_alt_index < 0 or dragen_alt_index >= len(dragen_alts):
+                return None
+
+            dragen_alt = dragen_alts[dragen_alt_index]
+            if dragen_alt not in forcecall_alts:
+                return None
+
+            forcecall_alt_index = forcecall_alts.index(dragen_alt) + 1
+            translated.append(str(forcecall_alt_index))
+
+        if not any(a != "0" for a in translated):
+            return None
+
+        return sep.join(translated)
+
+    def refine_forcecall_with_dragen(self, forcecall_vcf, dragen_vcf):
+        """
+        Final PharmCAT genotype policy:
+          - If DRAGEN has a PASS non-ref genotype for the same CHROM/POS/REF/ALT, use DRAGEN GT.
+          - If DRAGEN does not support a non-ref genotype at that PharmCAT forcecall site, force GT to 0/0.
+          - Never emit ./. in the refined VCF.
+
+        This makes the forcecall VCF serve as a complete PGx-site skeleton while DRAGEN decides
+        which non-reference genotypes are trusted.
+        """
+        refined_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.dragen_refined.vcf.gz"
+
+        self.log("[INFO] Refining forcecall VCF with DRAGEN VCF")
+        self.log(f"[INFO] Forcecall VCF: {forcecall_vcf}")
+        self.log(f"[INFO] DRAGEN VCF   : {dragen_vcf}")
+        self.log(f"[INFO] Refined VCF  : {refined_vcf}")
+
+        dragen_by_site = self.parse_dragen_gt_by_site(dragen_vcf)
+
+        used_dragen_nonref = 0
+        forced_to_ref = 0
+        already_ref = 0
+        untranslatable_dragen_sites = 0
+        total_variants = 0
+
+        with self.open_text_auto(forcecall_vcf) as in_fh, open(refined_vcf, "wb") as out_fh:
+            proc = subprocess.Popen(
+                ["bgzip", "-c"],
+                stdin=subprocess.PIPE,
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if proc.stdin is None or proc.stderr is None:
+                raise RuntimeError("Failed to open bgzip subprocess streams")
+
+            for line in in_fh:
+                if line.startswith("#"):
+                    proc.stdin.write(line)
+                    continue
+
+                cols = line.rstrip("\n").split("\t")
+                if len(cols) < 10:
+                    proc.stdin.write(line)
+                    continue
+
+                total_variants += 1
+
+                chrom = cols[0]
+                pos = cols[1]
+                ref = cols[3]
+                alt = cols[4]
+                forcecall_alts = alt.split(",")
+
+                fmt_keys = cols[8].split(":")
+                sample_values = cols[9].split(":")
+
+                if "GT" not in fmt_keys:
+                    raise RuntimeError(f"FORMAT/GT not found in forcecall VCF at {chrom}:{pos}")
+
+                gt_index = fmt_keys.index("GT")
+                original_gt = sample_values[gt_index] if gt_index < len(sample_values) else None
+
+                site_key = (chrom, pos, ref)
+                dragen_record = dragen_by_site.get(site_key)
+
+                if dragen_record is not None:
+                    translated_gt = self.translate_dragen_gt_to_forcecall_gt(
+                        dragen_record=dragen_record,
+                        forcecall_alts=forcecall_alts,
+                    )
+                    if translated_gt is not None:
+                        sample_values[gt_index] = translated_gt
+                        used_dragen_nonref += 1
+                    else:
+                        sample_values[gt_index] = self.force_ref_gt_like_existing(original_gt)
+                        forced_to_ref += 1
+                        untranslatable_dragen_sites += 1
+                else:
+                    ref_gt = self.force_ref_gt_like_existing(original_gt)
+                    if original_gt == ref_gt:
+                        already_ref += 1
+                    else:
+                        forced_to_ref += 1
+                    sample_values[gt_index] = ref_gt
+
+                cols[9] = ":".join(sample_values)
+                proc.stdin.write("\t".join(cols) + "\n")
+
+            proc.stdin.close()
+            stderr = proc.stderr.read()
+            ret = proc.wait()
+
+            if ret != 0:
+                raise RuntimeError(f"bgzip failed while refining VCF: {stderr.strip()}")
+
+        self.log(f"[INFO] Indexing DRAGEN-refined VCF: {refined_vcf}")
+        self.run_cmd(["tabix", "-f", "-p", "vcf", str(refined_vcf)])
+
+        self.log("[INFO] DRAGEN-refined VCF summary:")
+        self.log(f"[INFO]   forcecall records scanned                : {total_variants}")
+        self.log(f"[INFO]   DRAGEN non-ref genotypes applied         : {used_dragen_nonref}")
+        self.log(f"[INFO]   forcecall genotypes forced to 0/0        : {forced_to_ref}")
+        self.log(f"[INFO]   forcecall genotypes already 0/0          : {already_ref}")
+        self.log(f"[INFO]   DRAGEN sites not translatable to PGx ALT : {untranslatable_dragen_sites}")
+
+        return refined_vcf
 
     def run_forcecall(self):
         raw_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.raw.vcf.gz"
@@ -182,6 +449,7 @@ class PharmcatPipeline:
             "HaplotypeCaller",
             "--native-pair-hmm-threads", THREADS,
             "--alleles", str(POSITIONS_SITES_VCF),
+            "--genotyping-mode", "GENOTYPE_GIVEN_ALLELES",
             "-R", str(self.reference_fasta),
             "-I", str(self.alignment),
             "-O", str(raw_vcf),
@@ -219,12 +487,6 @@ class PharmcatPipeline:
         raise FileNotFoundError(
             f"Preprocessed VCF not found for sample_id '{self.sample_id}' in {self.output_dir}"
         )
-
-    def open_text_auto(self, path):
-        path = Path(path)
-        if path.suffix in {".gz", ".bgz"}:
-            return gzip.open(path, "rt")
-        return open(path, "r")
 
     def fix_inf_qual(self, preprocessed_vcf):
         fixed_vcf = self.output_dir / f"{self.sample_id}.preprocessed.fixed.vcf.gz"
@@ -315,9 +577,13 @@ class PharmcatPipeline:
         self.log(f"[INFO] alignment : {self.alignment}")
         self.log(f"[INFO] reference : {self.reference_fasta}")
         self.log(f"[INFO] outdir    : {self.output_dir}")
+        self.log(f"[INFO] dragen_vcf: {self.dragen_vcf if self.dragen_vcf else 'NA'}")
 
         self.ensure_file(self.reference_fasta, "Reference FASTA")
         self.ensure_file(self.alignment, "Alignment")
+        if self.dragen_vcf:
+            self.ensure_file(self.dragen_vcf, "DRAGEN VCF")
+
         self.require_tools()
         self.require_bcftools_version()
 
@@ -326,7 +592,16 @@ class PharmcatPipeline:
         self.ensure_alignment_index()
 
         raw_vcf = self.run_forcecall()
-        pre_vcf = self.run_preprocessor(raw_vcf)
+
+        if self.dragen_vcf:
+            pharmcat_input_vcf = self.refine_forcecall_with_dragen(
+                forcecall_vcf=raw_vcf,
+                dragen_vcf=self.dragen_vcf,
+            )
+        else:
+            pharmcat_input_vcf = raw_vcf
+
+        pre_vcf = self.run_preprocessor(pharmcat_input_vcf)
         fixed_vcf = self.fix_inf_qual(pre_vcf)
         self.run_pharmcat(fixed_vcf)
 
@@ -341,6 +616,7 @@ def main():
             reference_fasta=args.reference,
             output_dir=args.outdir,
             sample_id=args.sample_id,
+            dragen_vcf=args.dragen_vcf,
         ).run()
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr, flush=True)

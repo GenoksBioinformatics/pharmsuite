@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 # Fixed input TSV path inside the Docker image
-INPUT_TSV = Path("/opt/mpileup/pharmvariants_wfeatures.tsv")
+INPUT_TSV = Path("/opt/mpileup/input_loci.tsv")
 
 
 def parse_args():

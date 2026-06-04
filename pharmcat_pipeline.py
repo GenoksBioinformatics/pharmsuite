@@ -449,7 +449,6 @@ class PharmcatPipeline:
             "HaplotypeCaller",
             "--native-pair-hmm-threads", THREADS,
             "--alleles", str(POSITIONS_SITES_VCF),
-            "--genotyping-mode", "GENOTYPE_GIVEN_ALLELES",
             "-R", str(self.reference_fasta),
             "-I", str(self.alignment),
             "-O", str(raw_vcf),

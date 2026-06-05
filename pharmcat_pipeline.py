@@ -221,20 +221,147 @@ class PharmcatPipeline:
         """
         return "0/0"
 
-    def parse_dragen_gt_by_site(self, dragen_vcf):
+    @staticmethod
+    def variant_equivalence_key(chrom, pos, ref, alt):
         """
-        Reads DRAGEN VCF and stores PASS non-ref genotypes by (CHROM, POS, REF).
+        Build a parsimonious allele-comparison key without rewriting the VCF.
 
-        The value is a list, not a single record, so multiple DRAGEN records at the
-        same CHROM/POS/REF do not overwrite one another. Each candidate is later
-        tested against the forcecall ALT list.
+        This does NOT split multiallelic PharmCAT records. It is only used internally
+        to compare DRAGEN's often-minimal representation with PharmCAT/HaplotypeCaller
+        forcecall representation.
+
+        Examples:
+          chr10:94942290 CG>TG       -> chr10:94942290 C>T
+          chr2:233760233 CAT>CATAT   -> chr2:233760233 C>CAT
+        """
+        if alt in {".", ""} or alt.startswith("<") or ref in {".", ""}:
+            return chrom, str(pos), ref, alt
+
+        pos_int = int(pos)
+        ref_s = str(ref)
+        alt_s = str(alt)
+
+        # Trim identical suffix while both alleles keep at least one base.
+        while len(ref_s) > 1 and len(alt_s) > 1 and ref_s[-1] == alt_s[-1]:
+            ref_s = ref_s[:-1]
+            alt_s = alt_s[:-1]
+
+        # Trim identical prefix while both alleles keep at least one base.
+        while len(ref_s) > 1 and len(alt_s) > 1 and ref_s[0] == alt_s[0]:
+            ref_s = ref_s[1:]
+            alt_s = alt_s[1:]
+            pos_int += 1
+
+        return chrom, str(pos_int), ref_s, alt_s
+
+    @staticmethod
+    def split_info(info_str):
+        info = {}
+        order = []
+        if info_str in {"", "."}:
+            return info, order
+
+        for item in info_str.split(";"):
+            if not item:
+                continue
+            if "=" in item:
+                key, value = item.split("=", 1)
+            else:
+                key, value = item, None
+            info[key] = value
+            order.append(key)
+
+        return info, order
+
+    @staticmethod
+    def join_info(info, order):
+        seen = set()
+        parts = []
+
+        for key in order:
+            if key in seen or key not in info:
+                continue
+            seen.add(key)
+            value = info[key]
+            if value is None:
+                parts.append(key)
+            else:
+                parts.append(f"{key}={value}")
+
+        for key in sorted(info):
+            if key in seen:
+                continue
+            value = info[key]
+            if value is None:
+                parts.append(key)
+            else:
+                parts.append(f"{key}={value}")
+
+        return ";".join(parts) if parts else "."
+
+    @staticmethod
+    def format_af(value):
+        if value == 0:
+            return "0"
+        if value == 1:
+            return "1"
+        return f"{value:.6g}"
+
+    def update_info_counts_from_gt(self, info_str, gt, n_alts):
+        """
+        Keep AC/AF/AN and MLEAC/MLEAF consistent after genotype refinement.
+        PharmCAT primarily needs GT, but stale INFO fields are confusing and risky.
+        """
+        info, order = self.split_info(info_str)
+
+        alleles, _sep = self.normalize_gt(gt)
+        if not alleles:
+            alleles = ["0", "0"]
+
+        called_alleles = [a for a in alleles if a != "."]
+        an = len(called_alleles)
+        ac = [0] * n_alts
+
+        for allele in called_alleles:
+            try:
+                idx = int(allele)
+            except ValueError:
+                continue
+            if idx > 0 and idx <= n_alts:
+                ac[idx - 1] += 1
+
+        af = [(x / an) if an else 0 for x in ac]
+
+        info["AC"] = ",".join(str(x) for x in ac)
+        info["AN"] = str(an)
+        info["AF"] = ",".join(self.format_af(x) for x in af)
+
+        if "MLEAC" in info:
+            info["MLEAC"] = info["AC"]
+        if "MLEAF" in info:
+            info["MLEAF"] = info["AF"]
+
+        for key in ["AC", "AF", "AN"]:
+            if key not in order:
+                order.append(key)
+
+        return self.join_info(info, order)
+
+    def parse_dragen_gt_by_equivalence_key(self, dragen_vcf):
+        """
+        Reads DRAGEN VCF and indexes PASS non-ref genotypes by minimal allele key.
+
+        This avoids false 0/0 conversions when DRAGEN writes a minimal allele
+        representation but the PharmCAT forcecall VCF uses a longer parsimonious
+        multiallelic PGx representation.
         """
         self.ensure_file(dragen_vcf, "DRAGEN VCF")
 
-        dragen_by_site = {}
+        dragen_by_allele_key = {}
         samples = []
         total_records = 0
         kept_records = 0
+        indexed_alleles = 0
 
         with self.open_text_auto(dragen_vcf) as fh:
             for line in fh:
@@ -270,13 +397,41 @@ class PharmcatPipeline:
                     continue
 
                 alts = alt.split(",")
-                site_key = (chrom, pos, ref)
+                allele_keys = [
+                    self.variant_equivalence_key(chrom, pos, ref, alt_allele)
+                    for alt_allele in alts
+                ]
 
-                dragen_by_site.setdefault(site_key, []).append({
+                record = {
+                    "chrom": chrom,
+                    "pos": pos,
+                    "ref": ref,
                     "alts": alts,
                     "gt": gt,
                     "filter": filt,
-                })
+                    "allele_keys": allele_keys,
+                }
+
+                # Index only alleles that are actually present in the DRAGEN genotype.
+                dragen_alleles, _sep = self.normalize_gt(gt)
+                used_alt_indexes = set()
+                for allele in dragen_alleles or []:
+                    if allele in {"0", "."}:
+                        continue
+                    try:
+                        idx = int(allele) - 1
+                    except ValueError:
+                        continue
+                    if 0 <= idx < len(allele_keys):
+                        used_alt_indexes.add(idx)
+
+                if not used_alt_indexes:
+                    continue
+
+                for idx in used_alt_indexes:
+                    dragen_by_allele_key.setdefault(allele_keys[idx], []).append(record)
+                    indexed_alleles += 1
+
                 kept_records += 1
 
         if not samples:
@@ -285,20 +440,16 @@ class PharmcatPipeline:
         self.log(f"[INFO] DRAGEN sample used for refinement: {samples[0]}")
         self.log(f"[INFO] DRAGEN records scanned: {total_records}")
         self.log(f"[INFO] DRAGEN PASS non-ref records loaded: {kept_records}")
+        self.log(f"[INFO] DRAGEN non-ref allele keys indexed: {indexed_alleles}")
 
-        return dragen_by_site
+        return dragen_by_allele_key
 
-    def translate_dragen_gt_to_forcecall_gt(self, dragen_record, forcecall_alts):
+    def translate_dragen_gt_to_forcecall_gt(self, dragen_record, forcecall_key_to_index, forcecall_ploidy):
         """
-        Translate DRAGEN GT allele indexes to forcecall ALT indexes.
-        Returns None if the DRAGEN ALT cannot be represented in the forcecall record.
-
-        This is allele-level matching, so it works for SNVs and indels as long as
-        REF/ALT representation is the same.
+        Translate DRAGEN GT allele indexes to forcecall ALT indexes using equivalence keys.
+        Returns None if the DRAGEN genotype cannot be represented in the forcecall record.
         """
         dragen_gt = dragen_record["gt"]
-        dragen_alts = dragen_record["alts"]
-
         dragen_alleles, sep = self.normalize_gt(dragen_gt)
         if not dragen_alleles:
             return None
@@ -317,32 +468,40 @@ class PharmcatPipeline:
             except ValueError:
                 return None
 
-            if dragen_alt_index < 0 or dragen_alt_index >= len(dragen_alts):
+            allele_keys = dragen_record["allele_keys"]
+            if dragen_alt_index < 0 or dragen_alt_index >= len(allele_keys):
                 return None
 
-            dragen_alt = dragen_alts[dragen_alt_index]
-            if dragen_alt not in forcecall_alts:
+            dragen_allele_key = allele_keys[dragen_alt_index]
+            forcecall_alt_index = forcecall_key_to_index.get(dragen_allele_key)
+            if forcecall_alt_index is None:
                 return None
 
-            forcecall_alt_index = forcecall_alts.index(dragen_alt) + 1
             translated.append(str(forcecall_alt_index))
 
         if not any(a != "0" for a in translated):
             return None
+
+        # DRAGEN can emit haploid GTs on chrX/chrY. PharmCAT input is safer as diploid.
+        if len(translated) == 1 and forcecall_ploidy >= 2:
+            translated = [translated[0]] * forcecall_ploidy
+            sep = "/"
 
         return sep.join(translated)
 
     def refine_forcecall_with_dragen(self, forcecall_vcf, dragen_vcf):
         """
         Final PharmCAT genotype policy:
-          - If DRAGEN has a PASS non-ref genotype for the same CHROM/POS/REF/ALT,
+          - If DRAGEN has a PASS non-ref genotype equivalent to a PharmCAT forcecall ALT,
             use the DRAGEN genotype translated onto the forcecall ALT order.
-          - If DRAGEN does not support a non-ref genotype at that PharmCAT forcecall site,
+          - If DRAGEN does not support a non-ref genotype at that PharmCAT forcecall record,
             force GT to 0/0.
           - Never emit ./. in the refined VCF.
 
-        The forcecall VCF is a complete PGx-site skeleton; DRAGEN decides which
-        non-reference genotypes are trusted.
+        Important:
+          We do NOT run bcftools norm -m -any here because PharmCAT expects certain
+          PGx INDELs as combined multiallelic records. Equivalence matching is internal
+          only and does not atomize or rewrite the PharmCAT-style VCF representation.
         """
         refined_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.dragen_refined.vcf.gz"
 
@@ -351,7 +510,7 @@ class PharmcatPipeline:
         self.log(f"[INFO] DRAGEN VCF   : {dragen_vcf}")
         self.log(f"[INFO] Refined VCF  : {refined_vcf}")
 
-        dragen_by_site = self.parse_dragen_gt_by_site(dragen_vcf)
+        dragen_by_allele_key = self.parse_dragen_gt_by_equivalence_key(dragen_vcf)
 
         used_dragen_nonref = 0
         forced_to_ref = 0
@@ -398,14 +557,29 @@ class PharmcatPipeline:
                 gt_index = fmt_keys.index("GT")
                 original_gt = sample_values[gt_index] if gt_index < len(sample_values) else None
 
-                site_key = (chrom, pos, ref)
-                dragen_records = dragen_by_site.get(site_key, [])
+                original_alleles, _original_sep = self.normalize_gt(original_gt)
+                forcecall_ploidy = max(2, len(original_alleles or []))
+
+                forcecall_key_to_index = {}
+                candidate_records = []
+                seen_record_ids = set()
+
+                for idx, alt_allele in enumerate(forcecall_alts, start=1):
+                    key = self.variant_equivalence_key(chrom, pos, ref, alt_allele)
+                    forcecall_key_to_index[key] = idx
+
+                    for rec in dragen_by_allele_key.get(key, []):
+                        rec_id = id(rec)
+                        if rec_id not in seen_record_ids:
+                            seen_record_ids.add(rec_id)
+                            candidate_records.append(rec)
 
                 translated_gt = None
-                for dragen_record in dragen_records:
+                for dragen_record in candidate_records:
                     translated_gt = self.translate_dragen_gt_to_forcecall_gt(
                         dragen_record=dragen_record,
-                        forcecall_alts=forcecall_alts,
+                        forcecall_key_to_index=forcecall_key_to_index,
+                        forcecall_ploidy=forcecall_ploidy,
                     )
                     if translated_gt is not None:
                         break
@@ -420,11 +594,16 @@ class PharmcatPipeline:
                     else:
                         forced_to_ref += 1
 
-                    if dragen_records:
+                    if candidate_records:
                         untranslatable_dragen_sites += 1
 
                     sample_values[gt_index] = ref_gt
 
+                cols[7] = self.update_info_counts_from_gt(
+                    info_str=cols[7],
+                    gt=sample_values[gt_index],
+                    n_alts=len(forcecall_alts),
+                )
                 cols[9] = ":".join(sample_values)
                 proc.stdin.write("\t".join(cols) + "\n")
 
@@ -443,41 +622,9 @@ class PharmcatPipeline:
         self.log(f"[INFO]   DRAGEN non-ref genotypes applied         : {used_dragen_nonref}")
         self.log(f"[INFO]   forcecall genotypes forced to 0/0        : {forced_to_ref}")
         self.log(f"[INFO]   forcecall genotypes already 0/0          : {already_ref}")
-        self.log(f"[INFO]   DRAGEN sites not translatable to PGx ALT : {untranslatable_dragen_sites}")
+        self.log(f"[INFO]   candidate DRAGEN records not translatable: {untranslatable_dragen_sites}")
 
         return refined_vcf
-
-    def normalize_vcf_for_pharmcat(self, input_vcf):
-        """
-        Normalize and split multiallelic records before PharmCAT preprocessing.
-
-        Main goal:
-          - Split multiallelic records such as ALT=A,B into separate records.
-          - Left-normalize indels against the same reference FASTA.
-          - Keep the VCF bgzipped and indexed.
-
-        This is run after optional DRAGEN refinement and before PharmCAT preprocessor.
-        """
-        normalized_vcf = self.output_dir / f"{self.sample_id}.pharmcat.normalized_for_preprocessor.vcf.gz"
-
-        self.log("[INFO] Normalizing/splitting VCF before PharmCAT preprocessor")
-        self.log(f"[INFO] Input VCF      : {input_vcf}")
-        self.log(f"[INFO] Normalized VCF : {normalized_vcf}")
-
-        self.run_cmd([
-            "bcftools",
-            "norm",
-            "-f", str(self.reference_fasta),
-            "-m", "-any",
-            str(input_vcf),
-            "-Oz",
-            "-o", str(normalized_vcf),
-        ])
-
-        self.log(f"[INFO] Indexing normalized VCF: {normalized_vcf}")
-        self.run_cmd(["tabix", "-f", "-p", "vcf", str(normalized_vcf)])
-
-        return normalized_vcf
 
     def run_forcecall(self):
         raw_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.raw.vcf.gz"
@@ -638,8 +785,6 @@ class PharmcatPipeline:
             )
         else:
             pharmcat_input_vcf = raw_vcf
-
-        pharmcat_input_vcf = self.normalize_vcf_for_pharmcat(pharmcat_input_vcf)
 
         pre_vcf = self.run_preprocessor(pharmcat_input_vcf)
         fixed_vcf = self.fix_inf_qual(pre_vcf)

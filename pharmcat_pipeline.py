@@ -187,6 +187,8 @@ class PharmcatPipeline:
             fh.write(f"dragen_vcf\t{self.dragen_vcf if self.dragen_vcf else 'NA'}\n")
             fh.write("dragen_mode\tposition_support_filter_only\n")
             fh.write("dragen_policy\tforcecall_nonref_without_dragen_position_support_to_0/0\n")
+            fh.write("ad_balance_policy\t0/x_ALT_fraction_ge_0.85_to_x/x__0/x_ALT_fraction_le_0.15_to_0/0\n")
+            fh.write("ad_balance_fraction\tAD[x]/(AD[0]+AD[x])\n")
             fh.write("fields_modified_by_dragen_filter\tGT_only\n")
             fh.write(f"pharmcat_jar\t{PHARMCAT_JAR}\n")
             fh.write(f"pharmcat_preprocessor\t{PHARMCAT_PREPROCESSOR}\n")
@@ -245,6 +247,112 @@ class PharmcatPipeline:
         modify only GT and set it to diploid 0/0.
         """
         return "0/0"
+
+    @staticmethod
+    def split_gt_alleles(gt):
+        """
+        Split GT like 0/1, 0|1, 1/1.
+
+        Returns:
+            tuple[list[int] | None, str]: allele list and separator.
+        """
+        if gt is None:
+            return None, "/"
+
+        gt = str(gt).strip()
+        if gt in {"", ".", "./.", ".|."}:
+            return None, "/"
+
+        sep = "|" if "|" in gt else "/"
+        parts = gt.split(sep)
+
+        if not parts or any(part in {"", "."} for part in parts):
+            return None, sep
+
+        try:
+            alleles = [int(part) for part in parts]
+        except ValueError:
+            return None, sep
+
+        return alleles, sep
+
+    @staticmethod
+    def force_hom_alt_gt(original_gt, alt_index):
+        """
+        Convert GT to x/x or x|x while preserving ploidy and separator.
+        Example: 0/2 -> 2/2, 0|2 -> 2|2.
+        """
+        alleles, sep = PharmcatPipeline.split_gt_alleles(original_gt)
+        if alleles is None:
+            return original_gt
+
+        return sep.join([str(alt_index)] * len(alleles))
+
+    @staticmethod
+    def get_ad_based_gt_override(original_gt, fmt_keys, sample_values, high_ab=0.85, low_ab=0.15):
+        """
+        Apply AD-based genotype correction only for simple diploid 0/x calls.
+
+        Rule:
+            alt_fraction = AD[x] / (AD[0] + AD[x])
+
+            alt_fraction >= high_ab -> x/x
+            alt_fraction <= low_ab  -> 0/0
+
+        Returns:
+            tuple[str | None, str | None]: new GT and reason.
+        """
+        if original_gt is None or "AD" not in fmt_keys:
+            return None, None
+
+        alleles, _sep = PharmcatPipeline.split_gt_alleles(original_gt)
+        if alleles is None:
+            return None, None
+
+        # Only diploid 0/x genotypes. Leave 1/2, 1/1, 2/2, haploid etc. unchanged.
+        if len(alleles) != 2:
+            return None, None
+
+        unique_alleles = set(alleles)
+        if 0 not in unique_alleles:
+            return None, None
+
+        alt_alleles = [allele for allele in unique_alleles if allele != 0]
+        if len(alt_alleles) != 1:
+            return None, None
+
+        alt_index = alt_alleles[0]
+        ad_index = fmt_keys.index("AD")
+        if ad_index >= len(sample_values):
+            return None, None
+
+        ad_raw = sample_values[ad_index]
+        if ad_raw in {"", "."}:
+            return None, None
+
+        try:
+            ad_values = [int(value) if value not in {"", "."} else 0 for value in ad_raw.split(",")]
+        except ValueError:
+            return None, None
+
+        if len(ad_values) <= alt_index:
+            return None, None
+
+        ref_ad = ad_values[0]
+        alt_ad = ad_values[alt_index]
+        denom = ref_ad + alt_ad
+        if denom <= 0:
+            return None, None
+
+        alt_fraction = alt_ad / denom
+
+        if alt_fraction >= high_ab:
+            return PharmcatPipeline.force_hom_alt_gt(original_gt, alt_index), "AD_HIGH_TO_HOM_ALT"
+
+        if alt_fraction <= low_ab:
+            return PharmcatPipeline.force_ref_gt(original_gt), "AD_LOW_TO_REF"
+
+        return None, None
 
     def load_dragen_supported_positions(self, dragen_vcf):
         """
@@ -318,15 +426,19 @@ class PharmcatPipeline:
         """
         Core policy:
           - If forcecall GT is reference, leave record unchanged.
-          - If forcecall GT is non-ref and DRAGEN has any PASS non-ref call at same CHROM:POS,
-            leave record unchanged.
-          - If forcecall GT is non-ref and DRAGEN has no PASS non-ref call at same CHROM:POS,
+          - If forcecall GT is 0/x and AD[x] / (AD[0] + AD[x]) >= 0.85,
+            change only GT to x/x.
+          - If forcecall GT is 0/x and AD[x] / (AD[0] + AD[x]) <= 0.15,
             change only GT to 0/0.
+          - Otherwise, if forcecall GT is non-ref and DRAGEN has any PASS non-ref call
+            at same CHROM:POS, leave record unchanged.
+          - Otherwise, if forcecall GT is non-ref and DRAGEN has no PASS non-ref call
+            at same CHROM:POS, change only GT to 0/0.
           - Do not modify INFO, FILTER, QUAL, AD, DP, GQ, PL or any other FORMAT value.
         """
         filtered_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.dragen_position_filtered.vcf.gz"
 
-        self.log("[INFO] Filtering forcecall non-ref genotypes using DRAGEN position support")
+        self.log("[INFO] Filtering forcecall non-ref genotypes using AD balance and DRAGEN position support")
         self.log(f"[INFO] Forcecall VCF: {forcecall_vcf}")
         self.log(f"[INFO] DRAGEN VCF   : {dragen_vcf}")
         self.log(f"[INFO] Filtered VCF : {filtered_vcf}")
@@ -335,6 +447,9 @@ class PharmcatPipeline:
 
         total_records = 0
         forcecall_ref_unchanged = 0
+        forcecall_nonref_ad85_to_hom_alt = 0
+        forcecall_nonref_ad15_to_ref = 0
+        forcecall_nonref_ad_no_decision = 0
         forcecall_nonref_supported_unchanged = 0
         forcecall_nonref_forced_to_ref = 0
 
@@ -350,46 +465,83 @@ class PharmcatPipeline:
             if proc.stdin is None or proc.stderr is None:
                 raise RuntimeError("Failed to open bgzip subprocess streams")
 
-            for line in in_fh:
-                if line.startswith("#"):
-                    proc.stdin.write(line)
-                    continue
+            try:
+                for line in in_fh:
+                    if line.startswith("#"):
+                        proc.stdin.write(line)
+                        continue
 
-                cols = line.rstrip("\n").split("\t")
-                if len(cols) < 10:
-                    proc.stdin.write(line)
-                    continue
+                    cols = line.rstrip("\n").split("\t")
+                    if len(cols) < 10:
+                        proc.stdin.write(line)
+                        continue
 
-                total_records += 1
+                    total_records += 1
 
-                chrom, pos = cols[0], cols[1]
-                fmt_keys = cols[8].split(":")
-                sample_values = cols[9].split(":")
+                    chrom, pos = cols[0], cols[1]
+                    fmt_keys = cols[8].split(":")
+                    sample_values = cols[9].split(":")
 
-                if "GT" not in fmt_keys:
-                    raise RuntimeError(f"FORMAT/GT not found in forcecall VCF at {chrom}:{pos}")
+                    if "GT" not in fmt_keys:
+                        raise RuntimeError(f"FORMAT/GT not found in forcecall VCF at {chrom}:{pos}")
 
-                gt_index = fmt_keys.index("GT")
-                original_gt = sample_values[gt_index] if gt_index < len(sample_values) else None
+                    gt_index = fmt_keys.index("GT")
+                    if gt_index >= len(sample_values):
+                        raise RuntimeError(f"Sample FORMAT value missing GT at {chrom}:{pos}")
 
-                if not self.gt_is_nonref(original_gt):
-                    forcecall_ref_unchanged += 1
+                    original_gt = sample_values[gt_index]
+
+                    if not self.gt_is_nonref(original_gt):
+                        forcecall_ref_unchanged += 1
+                        proc.stdin.write("\t".join(cols) + "\n")
+                        continue
+
+                    ad_based_gt, ad_reason = self.get_ad_based_gt_override(
+                        original_gt=original_gt,
+                        fmt_keys=fmt_keys,
+                        sample_values=sample_values,
+                        high_ab=0.85,
+                        low_ab=0.15,
+                    )
+
+                    if ad_based_gt is not None and ad_based_gt != original_gt:
+                        sample_values[gt_index] = ad_based_gt
+                        cols[9] = ":".join(sample_values)
+
+                        if ad_reason == "AD_HIGH_TO_HOM_ALT":
+                            forcecall_nonref_ad85_to_hom_alt += 1
+                        elif ad_reason == "AD_LOW_TO_REF":
+                            forcecall_nonref_ad15_to_ref += 1
+
+                        proc.stdin.write("\t".join(cols) + "\n")
+                        continue
+
+                    forcecall_nonref_ad_no_decision += 1
+
+                    has_dragen_support = any(
+                        key in supported_positions
+                        for key in self.normalize_chrom_keys(chrom, pos)
+                    )
+
+                    if has_dragen_support:
+                        forcecall_nonref_supported_unchanged += 1
+                    else:
+                        sample_values[gt_index] = self.force_ref_gt(original_gt)
+                        cols[9] = ":".join(sample_values)
+                        forcecall_nonref_forced_to_ref += 1
+
                     proc.stdin.write("\t".join(cols) + "\n")
-                    continue
 
-                has_dragen_support = any(
-                    key in supported_positions
-                    for key in self.normalize_chrom_keys(chrom, pos)
-                )
-
-                if has_dragen_support:
-                    forcecall_nonref_supported_unchanged += 1
-                else:
-                    sample_values[gt_index] = self.force_ref_gt(original_gt)
-                    cols[9] = ":".join(sample_values)
-                    forcecall_nonref_forced_to_ref += 1
-
-                proc.stdin.write("\t".join(cols) + "\n")
+            except Exception:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise
 
             proc.stdin.close()
             stderr = proc.stderr.read()
@@ -404,6 +556,9 @@ class PharmcatPipeline:
         self.log("[INFO] DRAGEN position support filtering summary:")
         self.log(f"[INFO]   forcecall records scanned                         : {total_records}")
         self.log(f"[INFO]   forcecall reference genotypes left unchanged      : {forcecall_ref_unchanged}")
+        self.log(f"[INFO]   forcecall 0/x with ALT fraction >= 0.85 -> x/x   : {forcecall_nonref_ad85_to_hom_alt}")
+        self.log(f"[INFO]   forcecall 0/x with ALT fraction <= 0.15 -> 0/0   : {forcecall_nonref_ad15_to_ref}")
+        self.log(f"[INFO]   forcecall non-ref AD no decision                  : {forcecall_nonref_ad_no_decision}")
         self.log(f"[INFO]   forcecall non-ref with DRAGEN support unchanged   : {forcecall_nonref_supported_unchanged}")
         self.log(f"[INFO]   forcecall non-ref without DRAGEN support -> 0/0   : {forcecall_nonref_forced_to_ref}")
 
@@ -424,7 +579,7 @@ class PharmcatPipeline:
             "-L", str(POSITIONS_SITES_VCF),
             "-ip", "20",
             "--max-mnp-distance", "1",
-            "--output-mode", "EMIT_ALL_ACTIVE_SITES",
+            "--output-mode", "EMIT_ALL_CONFIDENT_SITES",
         ])
 
         self.log(f"[INFO] Indexing raw VCF: {raw_vcf}")

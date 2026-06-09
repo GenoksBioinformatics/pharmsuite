@@ -76,7 +76,7 @@ Use this to check each predefined variant's depth and allele fraction.
 docker run --rm \
   -v /path/to/input_data:/data \
   -v /path/to/output_dir:/out \
-  pharmsuite:latest \
+  mertcdll/pharmsuite:0.1.1 \
     python3 /usr/local/bin/annotate_mpileup.py \
       --cram /data/sample.cram \
       --reference /data/reference.fa \

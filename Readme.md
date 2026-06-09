@@ -1,6 +1,3 @@
-Tabii, hafif güncellenmiş hali şöyle:
-
-````markdown
 # PharmSuite Docker Pipeline
 
 A lightweight Docker-based pipeline for single-sample PharmCAT preprocessing, PharmCAT reporting, DRAGEN-assisted genotype refinement, and targeted mpileup annotation.

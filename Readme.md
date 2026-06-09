@@ -45,7 +45,7 @@ docker build --no-cache -t pharmsuite:latest .
 docker run --rm \
   -v /path/to/input_data:/data \
   -v /path/to/output_dir:/out \
-  pharmsuite:latest \
+  mertcdll/pharmsuite:0.1.1 \
     python3 /usr/local/bin/pharmcat_pipeline.py \
       --cram /data/sample.cram \
       --reference /data/reference.fa \
@@ -59,7 +59,7 @@ docker run --rm \
 docker run --rm \
   -v /path/to/input_data:/data \
   -v /path/to/output_dir:/out \
-  pharmsuite:latest \
+  mertcdll/pharmsuite:0.1.1 \
     python3 /usr/local/bin/pharmcat_pipeline.py \
       --cram /data/sample.cram \
       --reference /data/reference.fa \

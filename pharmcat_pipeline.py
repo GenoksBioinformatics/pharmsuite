@@ -21,6 +21,20 @@ MIN_BCFTOOLS_VERSION = (1, 20)
 
 REF_GTS = {"0/0", "0|0", "0", "./.", ".|.", "."}
 
+# The only true multi-base (MNP) sites in the PharmCAT panel: both are RYR1
+# dinucleotide substitutions and require GATK's --max-mnp-distance 1 to be
+# called as a single 2bp event instead of two separate 1bp SNPs.
+# (chrom, anchor_pos, ref_len_in_bp)
+MNP_SPLICE_SITES = [
+    ("chr19", 38572266, 2),  # rs193922862, TC>CT
+    ("chr19", 38580039, 2),  # unnamed, TT>AA
+]
+
+# The only sex-chromosome gene in the PharmCAT panel (G6PD) is on chrX,
+# outside the pseudoautosomal regions, so it is hemizygous (ploidy 1) in XY
+# samples. All chrX positions in the panel belong to this gene.
+CHRX_HAPLOID_CHROM = "chrX"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -45,16 +59,29 @@ def parse_args():
             "INFO/AD/DP/GQ/PL are not modified."
         ),
     )
+    parser.add_argument(
+        "--ploidy-metrics",
+        required=False,
+        default=None,
+        help=(
+            "Optional DRAGEN ploidy_estimation_metrics.csv for this sample. If present and "
+            "the 'Ploidy estimation' row reads XY, chrX (G6PD) positions are forcecalled "
+            "with --sample-ploidy 1 instead of the default diploid model. Any other value "
+            "(XX, etc.) or a missing file leaves chrX diploid, unchanged."
+        ),
+    )
     return parser.parse_args()
 
 
 class PharmcatPipeline:
-    def __init__(self, cram, reference_fasta, output_dir, sample_id, dragen_vcf=None):
+    def __init__(self, cram, reference_fasta, output_dir, sample_id, dragen_vcf=None, ploidy_metrics=None):
         self.alignment = Path(cram).expanduser().resolve()
         self.reference_fasta = Path(reference_fasta).expanduser().resolve()
         self.output_dir = Path(output_dir).expanduser().resolve()
         self.sample_id = sample_id.strip()
         self.dragen_vcf = Path(dragen_vcf).expanduser().resolve() if dragen_vcf else None
+        self.ploidy_metrics = Path(ploidy_metrics).expanduser().resolve() if ploidy_metrics else None
+        self.sample_sex = None
 
         if not self.sample_id:
             raise ValueError("sample_id cannot be empty")
@@ -178,6 +205,36 @@ class PharmcatPipeline:
         else:
             raise ValueError(f"Unsupported alignment type: {self.alignment}")
 
+    def detect_sample_sex(self):
+        """
+        Read the 'Ploidy estimation' row out of a DRAGEN ploidy_estimation_metrics.csv.
+
+        Returns "XY", "XX", some other DRAGEN-reported value (e.g. "XO", "XXY"), or
+        None if --ploidy-metrics wasn't given. Only an exact "XY" triggers haploid
+        chrX forcecalling; everything else keeps the default diploid behavior.
+        """
+        if self.ploidy_metrics is None:
+            self.log("[INFO] No --ploidy-metrics given: chrX (G6PD) will be forcecalled as diploid")
+            return None
+
+        self.ensure_file(self.ploidy_metrics, "Ploidy metrics CSV")
+
+        ploidy_value = None
+        with open(self.ploidy_metrics, "r") as fh:
+            for line in fh:
+                fields = line.rstrip("\n").split(",")
+                if len(fields) >= 4 and fields[2].strip() == "Ploidy estimation":
+                    ploidy_value = fields[3].strip()
+                    break
+
+        if ploidy_value is None:
+            raise RuntimeError(
+                f"Could not find a 'Ploidy estimation' row in {self.ploidy_metrics}"
+            )
+
+        self.log(f"[INFO] Ploidy metrics report: Ploidy estimation = {ploidy_value}")
+        return ploidy_value
+
     def write_input_check(self):
         out = self.output_dir / f"{self.sample_id}.inputs.txt"
         with open(out, "w") as fh:
@@ -185,6 +242,12 @@ class PharmcatPipeline:
             fh.write(f"alignment\t{self.alignment}\n")
             fh.write(f"reference_fasta\t{self.reference_fasta}\n")
             fh.write(f"dragen_vcf\t{self.dragen_vcf if self.dragen_vcf else 'NA'}\n")
+            mnp_sites_str = ";".join(f"{c}:{p}" for c, p, _ in MNP_SPLICE_SITES)
+            fh.write("mnp_calling_policy\tdefault_forcecall_genomewide_plus_mnp1_spliced_at_known_dinucleotide_sites\n")
+            fh.write(f"mnp_spliced_sites\t{mnp_sites_str}\n")
+            fh.write(f"ploidy_metrics\t{self.ploidy_metrics if self.ploidy_metrics else 'NA'}\n")
+            fh.write(f"detected_sample_sex\t{self.sample_sex if self.sample_sex else 'NA'}\n")
+            fh.write(f"chrx_ploidy_policy\thaploid_sample_ploidy_1_if_XY_else_diploid_default\t(chrom={CHRX_HAPLOID_CHROM}, gene=G6PD)\n")
             fh.write("dragen_mode\tposition_support_filter_only\n")
             fh.write("dragen_policy\tforcecall_nonref_without_dragen_position_support_to_0/0\n")
             fh.write("ad_balance_policy\t0/x_ALT_fraction_ge_0.85_to_x/x__0/x_ALT_fraction_le_0.15_to_0/0\n")
@@ -564,10 +627,8 @@ class PharmcatPipeline:
 
         return filtered_vcf
 
-    def run_forcecall(self):
-        raw_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.raw.vcf.gz"
-
-        self.run_cmd([
+    def _run_haplotypecaller(self, output_vcf, extra_args=None):
+        cmd = [
             "gatk",
             "--java-options", f"-Xmx{JAVA_MEM}",
             "HaplotypeCaller",
@@ -575,17 +636,244 @@ class PharmcatPipeline:
             "--alleles", str(POSITIONS_SITES_VCF),
             "-R", str(self.reference_fasta),
             "-I", str(self.alignment),
-            "-O", str(raw_vcf),
+            "-O", str(output_vcf),
             "-L", str(POSITIONS_SITES_VCF),
             "-ip", "20",
-            "--max-mnp-distance", "1",
             "--output-mode", "EMIT_ALL_CONFIDENT_SITES",
-        ])
+        ]
+        if extra_args:
+            cmd.extend(extra_args)
 
-        self.log(f"[INFO] Indexing raw VCF: {raw_vcf}")
-        self.run_cmd(["tabix", "-f", "-p", "vcf", str(raw_vcf)])
+        self.run_cmd(cmd)
 
-        return raw_vcf
+        self.log(f"[INFO] Indexing VCF: {output_vcf}")
+        self.run_cmd(["tabix", "-f", "-p", "vcf", str(output_vcf)])
+
+    @staticmethod
+    def _mnp_removal_positions():
+        """
+        All (chrom, pos) keys spanned by each MNP_SPLICE_SITES anchor, e.g. a
+        2bp site at pos N spans N and N+1.
+        """
+        positions = set()
+        for chrom, anchor, ref_len in MNP_SPLICE_SITES:
+            for offset in range(ref_len):
+                positions.add((chrom, str(anchor + offset)))
+        return positions
+
+    def _extract_mnp_anchor_lines(self, mnp_vcf):
+        anchors = {(chrom, str(pos)) for chrom, pos, _ in MNP_SPLICE_SITES}
+        lines = {}
+
+        with self.open_text_auto(mnp_vcf) as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                cols = line.rstrip("\n").split("\t")
+                key = (cols[0], cols[1])
+                if key in anchors:
+                    lines[key] = line if line.endswith("\n") else line + "\n"
+
+        missing = anchors - set(lines.keys())
+        if missing:
+            raise RuntimeError(
+                f"MNP-mode forcecall is missing expected record(s) at: {sorted(missing)}"
+            )
+
+        return lines
+
+    def splice_mnp_target_sites(self, default_vcf, mnp_vcf):
+        """
+        Use the default (non-MNP-merged) forcecall for the whole panel, except
+        at the known RYR1 dinucleotide sites, where the MNP-merged (2bp)
+        record is spliced in instead. This avoids GATK's --max-mnp-distance
+        from silently entangling unrelated nearby SNPs elsewhere in the panel
+        while still correctly calling the two true MNP sites.
+        """
+        spliced_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.raw.vcf.gz"
+
+        self.log("[INFO] Splicing MNP-mode calls into default forcecall for known dinucleotide sites")
+        self.log(f"[INFO] Default forcecall VCF : {default_vcf}")
+        self.log(f"[INFO] MNP-mode forcecall VCF: {mnp_vcf}")
+        self.log(f"[INFO] Spliced target sites  : {[(c, p) for c, p, _ in MNP_SPLICE_SITES]}")
+
+        remove_positions = self._mnp_removal_positions()
+        anchor_lines = self._extract_mnp_anchor_lines(mnp_vcf)
+        anchor_positions_pending = {(c, str(p)) for c, p, _ in MNP_SPLICE_SITES}
+
+        removed_count = 0
+        spliced_count = 0
+
+        with self.open_text_auto(default_vcf) as in_fh, open(spliced_vcf, "wb") as out_fh:
+            proc = subprocess.Popen(
+                ["bgzip", "-c"],
+                stdin=subprocess.PIPE,
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if proc.stdin is None or proc.stderr is None:
+                raise RuntimeError("Failed to open bgzip subprocess streams")
+
+            try:
+                for line in in_fh:
+                    if line.startswith("#"):
+                        proc.stdin.write(line)
+                        continue
+
+                    cols = line.rstrip("\n").split("\t")
+                    key = (cols[0], cols[1])
+
+                    if key in remove_positions:
+                        removed_count += 1
+                        if key in anchor_positions_pending:
+                            proc.stdin.write(anchor_lines[key])
+                            anchor_positions_pending.discard(key)
+                            spliced_count += 1
+                        continue
+
+                    proc.stdin.write(line)
+            except Exception:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise
+
+            proc.stdin.close()
+            stderr = proc.stderr.read()
+            ret = proc.wait()
+
+            if ret != 0:
+                raise RuntimeError(f"bgzip failed while splicing MNP sites: {stderr.strip()}")
+
+        if anchor_positions_pending:
+            raise RuntimeError(
+                f"MNP anchor position(s) not found in default forcecall VCF: {sorted(anchor_positions_pending)}"
+            )
+
+        self.log(f"[INFO] Removed {removed_count} default-run record(s) within MNP target site span(s)")
+        self.log(f"[INFO] Inserted {spliced_count} MNP-mode record(s) at target anchor position(s)")
+
+        self.log(f"[INFO] Indexing spliced VCF: {spliced_vcf}")
+        self.run_cmd(["tabix", "-f", "-p", "vcf", str(spliced_vcf)])
+
+        return spliced_vcf
+
+    def splice_chrx_haploid_calls(self, base_vcf, chrx_vcf):
+        """
+        Replace all chrX records in base_vcf (called diploid by default) with the
+        --sample-ploidy 1 records from chrx_vcf. Only used for XY samples. chrX is
+        the last chromosome block in the PharmCAT panel, so the haploid records can
+        simply be appended after every non-chrX record has been streamed through.
+        """
+        adjusted_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.chrx_adjusted.vcf.gz"
+
+        self.log("[INFO] Splicing haploid (--sample-ploidy 1) chrX calls into forcecall (sample detected as XY)")
+        self.log(f"[INFO] Base forcecall VCF: {base_vcf}")
+        self.log(f"[INFO] chrX haploid VCF  : {chrx_vcf}")
+
+        chrx_lines = []
+        with self.open_text_auto(chrx_vcf) as fh:
+            for line in fh:
+                if line.startswith("#"):
+                    continue
+                chrom = line.split("\t", 1)[0]
+                if chrom == CHRX_HAPLOID_CHROM:
+                    chrx_lines.append(line if line.endswith("\n") else line + "\n")
+
+        if not chrx_lines:
+            raise RuntimeError(f"No {CHRX_HAPLOID_CHROM} records found in haploid forcecall VCF: {chrx_vcf}")
+
+        removed_count = 0
+
+        with self.open_text_auto(base_vcf) as in_fh, open(adjusted_vcf, "wb") as out_fh:
+            proc = subprocess.Popen(
+                ["bgzip", "-c"],
+                stdin=subprocess.PIPE,
+                stdout=out_fh,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+            if proc.stdin is None or proc.stderr is None:
+                raise RuntimeError("Failed to open bgzip subprocess streams")
+
+            try:
+                for line in in_fh:
+                    if line.startswith("#"):
+                        proc.stdin.write(line)
+                        continue
+
+                    chrom = line.split("\t", 1)[0]
+                    if chrom == CHRX_HAPLOID_CHROM:
+                        removed_count += 1
+                        continue
+
+                    proc.stdin.write(line)
+
+                for line in chrx_lines:
+                    proc.stdin.write(line)
+            except Exception:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                raise
+
+            proc.stdin.close()
+            stderr = proc.stderr.read()
+            ret = proc.wait()
+
+            if ret != 0:
+                raise RuntimeError(f"bgzip failed while splicing chrX haploid calls: {stderr.strip()}")
+
+        self.log(f"[INFO] Removed {removed_count} diploid {CHRX_HAPLOID_CHROM} record(s) from default forcecall")
+        self.log(f"[INFO] Inserted {len(chrx_lines)} haploid {CHRX_HAPLOID_CHROM} record(s)")
+
+        self.log(f"[INFO] Indexing chrX-adjusted VCF: {adjusted_vcf}")
+        self.run_cmd(["tabix", "-f", "-p", "vcf", str(adjusted_vcf)])
+
+        return adjusted_vcf
+
+    def run_forcecall(self):
+        default_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.default.vcf.gz"
+        mnp_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.mnp_sites.vcf.gz"
+
+        self.log("[INFO] Running default (non-MNP-merged) forcecall for the full PharmCAT panel")
+        self._run_haplotypecaller(default_vcf)
+
+        self.log("[INFO] Running MNP-merged forcecall to capture known dinucleotide PharmCAT sites (RYR1)")
+        self._run_haplotypecaller(mnp_vcf, extra_args=["--max-mnp-distance", "1"])
+
+        working_vcf = default_vcf
+        sample_sex = self.sample_sex
+
+        if sample_sex == "XY":
+            chrx_vcf = self.output_dir / f"{self.sample_id}.pharmcat.forcecall.chrx_haploid.vcf.gz"
+            self.log(f"[INFO] Sample detected as XY: forcecalling {CHRX_HAPLOID_CHROM} (G6PD) at --sample-ploidy 1")
+            self._run_haplotypecaller(
+                chrx_vcf,
+                extra_args=[
+                    "-L", CHRX_HAPLOID_CHROM,
+                    "--interval-set-rule", "INTERSECTION",
+                    "--sample-ploidy", "1",
+                ],
+            )
+            working_vcf = self.splice_chrx_haploid_calls(working_vcf, chrx_vcf)
+        elif sample_sex is not None:
+            self.log(f"[INFO] Sample ploidy estimation is '{sample_sex}' (not XY): {CHRX_HAPLOID_CHROM} (G6PD) stays diploid")
+
+        return self.splice_mnp_target_sites(working_vcf, mnp_vcf)
 
     def run_preprocessor(self, raw_vcf):
         self.run_cmd([
@@ -708,8 +996,13 @@ class PharmcatPipeline:
             self.ensure_file(self.dragen_vcf, "DRAGEN VCF")
             self.require_vcf_index(self.dragen_vcf, "DRAGEN VCF")
 
+        if self.ploidy_metrics:
+            self.ensure_file(self.ploidy_metrics, "Ploidy metrics CSV")
+
         self.require_tools()
         self.require_bcftools_version()
+
+        self.sample_sex = self.detect_sample_sex()
 
         self.write_input_check()
         self.ensure_reference_indexes()
@@ -741,6 +1034,7 @@ def main():
             output_dir=args.outdir,
             sample_id=args.sample_id,
             dragen_vcf=args.dragen_vcf,
+            ploidy_metrics=args.ploidy_metrics,
         ).run()
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr, flush=True)

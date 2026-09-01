@@ -978,6 +978,8 @@ class PharmcatPipeline:
             str(PHARMCAT_JAR),
             "-vcf", str(fixed_vcf),
             "-o", str(tmp_dir),
+            "-reporterHtml",
+            "-reporterJson",
         ])
 
         self.flatten_pharmcat_outputs(tmp_dir)
